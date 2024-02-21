@@ -31,6 +31,8 @@ $ docker exec -it registry /usr/bin/registry garbage-collect /etc/docker-distrib
 
 ## OPTIONS
 
+See also [skopeo(1)](skopeo.1.md) for options placed before the subcommand name.
+
 **--authfile** _path_
 
 Path of the authentication file. Default is ${XDG_RUNTIME\_DIR}/containers/auth.json, which is set using `skopeo login`.
@@ -85,7 +87,7 @@ The password to access the registry.
 ## EXAMPLES
 
 Mark image example/pause for deletion from the registry.example.com registry:
-```sh
+```console
 $ skopeo delete docker://registry.example.com/example/pause:latest
 ```
 See above for additional details on using the command **delete**.

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 
@@ -24,6 +23,7 @@ import (
 	"github.com/containers/image/v5/pkg/blobinfocache/none"
 	"github.com/containers/image/v5/pkg/sysregistriesv2"
 	"github.com/containers/image/v5/types"
+	"github.com/containers/storage/pkg/regexp"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
 )
@@ -38,8 +38,8 @@ type dockerImageSource struct {
 	impl.DoesNotAffectLayerInfosForCopy
 	stubs.ImplementsGetBlobAt
 
-	logicalRef  dockerReference // The reference the user requested.
-	physicalRef dockerReference // The actual reference we are accessing (possibly a mirror)
+	logicalRef  dockerReference // The reference the user requested. This must satisfy !isUnknownDigest
+	physicalRef dockerReference // The actual reference we are accessing (possibly a mirror). This must satisfy !isUnknownDigest
 	c           *dockerClient
 	// State
 	cachedManifest         []byte // nil if not loaded yet
@@ -48,7 +48,12 @@ type dockerImageSource struct {
 
 // newImageSource creates a new ImageSource for the specified image reference.
 // The caller must call .Close() on the returned ImageSource.
+// The caller must ensure !ref.isUnknownDigest.
 func newImageSource(ctx context.Context, sys *types.SystemContext, ref dockerReference) (*dockerImageSource, error) {
+	if ref.isUnknownDigest {
+		return nil, fmt.Errorf("reading images from docker: reference %q without a tag or digest is not supported", ref.StringWithinTransport())
+	}
+
 	registryConfig, err := loadRegistryConfiguration(sys)
 	if err != nil {
 		return nil, err
@@ -121,7 +126,7 @@ func newImageSource(ctx context.Context, sys *types.SystemContext, ref dockerRef
 // The caller must call .Close() on the returned ImageSource.
 func newImageSourceAttempt(ctx context.Context, sys *types.SystemContext, logicalRef dockerReference, pullSource sysregistriesv2.PullSource,
 	registryConfig *registryConfiguration) (*dockerImageSource, error) {
-	physicalRef, err := newReference(pullSource.Reference)
+	physicalRef, err := newReference(pullSource.Reference, false)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +158,7 @@ func newImageSourceAttempt(ctx context.Context, sys *types.SystemContext, logica
 	s.Compat = impl.AddCompat(s)
 
 	if err := s.ensureManifestIsLoaded(ctx); err != nil {
+		client.Close()
 		return nil, err
 	}
 	return s, nil
@@ -166,7 +172,7 @@ func (s *dockerImageSource) Reference() types.ImageReference {
 
 // Close removes resources associated with an initialized ImageSource, if any.
 func (s *dockerImageSource) Close() error {
-	return nil
+	return s.c.Close()
 }
 
 // simplifyContentType drops parameters from a HTTP media type (see https://tools.ietf.org/html/rfc7231#section-3.1.1.1)
@@ -250,7 +256,7 @@ func splitHTTP200ResponseToPartial(streams chan io.ReadCloser, errs chan error, 
 			currentOffset += toSkip
 		}
 		s := signalCloseReader{
-			closed:        make(chan interface{}),
+			closed:        make(chan struct{}),
 			stream:        io.NopCloser(io.LimitReader(body, int64(c.Length))),
 			consumeStream: true,
 		}
@@ -292,7 +298,7 @@ func handle206Response(streams chan io.ReadCloser, errs chan error, body io.Read
 			return
 		}
 		s := signalCloseReader{
-			closed: make(chan interface{}),
+			closed: make(chan struct{}),
 			stream: p,
 		}
 		streams <- s
@@ -303,7 +309,7 @@ func handle206Response(streams chan io.ReadCloser, errs chan error, body io.Read
 	}
 }
 
-var multipartByteRangesRe = regexp.MustCompile("multipart/byteranges; boundary=([A-Za-z-0-9:]+)")
+var multipartByteRangesRe = regexp.Delayed("multipart/byteranges; boundary=([A-Za-z-0-9:]+)")
 
 func parseMediaType(contentType string) (string, map[string]string, error) {
 	mediaType, params, err := mime.ParseMediaType(contentType)
@@ -335,7 +341,7 @@ func parseMediaType(contentType string) (string, map[string]string, error) {
 func (s *dockerImageSource) GetBlobAt(ctx context.Context, info types.BlobInfo, chunks []private.ImageSourceChunk) (chan io.ReadCloser, chan error, error) {
 	headers := make(map[string][]string)
 
-	var rangeVals []string
+	rangeVals := make([]string, 0, len(chunks))
 	for _, c := range chunks {
 		rangeVals = append(rangeVals, fmt.Sprintf("%d-%d", c.Offset, c.Offset+c.Length-1))
 	}
@@ -456,8 +462,8 @@ func (s *dockerImageSource) getSignaturesFromLookaside(ctx context.Context, inst
 			return nil, fmt.Errorf("server provided %d signatures, assuming that's unreasonable and a server error", maxLookasideSignatures)
 		}
 
-		url := lookasideStorageURL(s.c.signatureBase, manifestDigest, i)
-		signature, missing, err := s.getOneSignature(ctx, url)
+		sigURL := lookasideStorageURL(s.c.signatureBase, manifestDigest, i)
+		signature, missing, err := s.getOneSignature(ctx, sigURL)
 		if err != nil {
 			return nil, err
 		}
@@ -469,14 +475,14 @@ func (s *dockerImageSource) getSignaturesFromLookaside(ctx context.Context, inst
 	return signatures, nil
 }
 
-// getOneSignature downloads one signature from url, and returns (signature, false, nil)
+// getOneSignature downloads one signature from sigURL, and returns (signature, false, nil)
 // If it successfully determines that the signature does not exist, returns (nil, true, nil).
 // NOTE: Keep this in sync with docs/signature-protocols.md!
-func (s *dockerImageSource) getOneSignature(ctx context.Context, url *url.URL) (signature.Signature, bool, error) {
-	switch url.Scheme {
+func (s *dockerImageSource) getOneSignature(ctx context.Context, sigURL *url.URL) (signature.Signature, bool, error) {
+	switch sigURL.Scheme {
 	case "file":
-		logrus.Debugf("Reading %s", url.Path)
-		sigBlob, err := os.ReadFile(url.Path)
+		logrus.Debugf("Reading %s", sigURL.Path)
+		sigBlob, err := os.ReadFile(sigURL.Path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil, true, nil
@@ -485,13 +491,13 @@ func (s *dockerImageSource) getOneSignature(ctx context.Context, url *url.URL) (
 		}
 		sig, err := signature.FromBlob(sigBlob)
 		if err != nil {
-			return nil, false, fmt.Errorf("parsing signature %q: %w", url.Path, err)
+			return nil, false, fmt.Errorf("parsing signature %q: %w", sigURL.Path, err)
 		}
 		return sig, false, nil
 
 	case "http", "https":
-		logrus.Debugf("GET %s", url.Redacted())
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url.String(), nil)
+		logrus.Debugf("GET %s", sigURL.Redacted())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, sigURL.String(), nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -504,12 +510,12 @@ func (s *dockerImageSource) getOneSignature(ctx context.Context, url *url.URL) (
 			logrus.Debugf("... got status 404, as expected = end of signatures")
 			return nil, true, nil
 		} else if res.StatusCode != http.StatusOK {
-			return nil, false, fmt.Errorf("reading signature from %s: status %d (%s)", url.Redacted(), res.StatusCode, http.StatusText(res.StatusCode))
+			return nil, false, fmt.Errorf("reading signature from %s: status %d (%s)", sigURL.Redacted(), res.StatusCode, http.StatusText(res.StatusCode))
 		}
 
 		contentType := res.Header.Get("Content-Type")
 		if mimeType := simplifyContentType(contentType); mimeType == "text/html" {
-			logrus.Warnf("Signature %q has Content-Type %q, unexpected for a signature", url.Redacted(), contentType)
+			logrus.Warnf("Signature %q has Content-Type %q, unexpected for a signature", sigURL.Redacted(), contentType)
 			// Don’t immediately fail; the lookaside spec does not place any requirements on Content-Type.
 			// If the content really is HTML, it’s going to fail in signature.FromBlob.
 		}
@@ -520,12 +526,12 @@ func (s *dockerImageSource) getOneSignature(ctx context.Context, url *url.URL) (
 		}
 		sig, err := signature.FromBlob(sigBlob)
 		if err != nil {
-			return nil, false, fmt.Errorf("parsing signature %s: %w", url.Redacted(), err)
+			return nil, false, fmt.Errorf("parsing signature %s: %w", sigURL.Redacted(), err)
 		}
 		return sig, false, nil
 
 	default:
-		return nil, false, fmt.Errorf("Unsupported scheme when reading signature from %s", url.Redacted())
+		return nil, false, fmt.Errorf("Unsupported scheme when reading signature from %s", sigURL.Redacted())
 	}
 }
 
@@ -590,6 +596,10 @@ func (s *dockerImageSource) getSignaturesFromSigstoreAttachments(ctx context.Con
 
 // deleteImage deletes the named image from the registry, if supported.
 func deleteImage(ctx context.Context, sys *types.SystemContext, ref dockerReference) error {
+	if ref.isUnknownDigest {
+		return fmt.Errorf("Docker reference without a tag or digest cannot be deleted")
+	}
+
 	registryConfig, err := loadRegistryConfiguration(sys)
 	if err != nil {
 		return err
@@ -605,6 +615,7 @@ func deleteImage(ctx context.Context, sys *types.SystemContext, ref dockerRefere
 	if err != nil {
 		return err
 	}
+	defer c.Close()
 
 	headers := map[string][]string{
 		"Accept": manifest.DefaultRequestedManifestMIMETypes,
@@ -649,8 +660,8 @@ func deleteImage(ctx context.Context, sys *types.SystemContext, ref dockerRefere
 	}
 
 	for i := 0; ; i++ {
-		url := lookasideStorageURL(c.signatureBase, manifestDigest, i)
-		missing, err := c.deleteOneSignature(url)
+		sigURL := lookasideStorageURL(c.signatureBase, manifestDigest, i)
+		missing, err := c.deleteOneSignature(sigURL)
 		if err != nil {
 			return err
 		}
@@ -766,7 +777,7 @@ func makeBufferedNetworkReader(stream io.ReadCloser, nBuffers, bufferSize uint) 
 }
 
 type signalCloseReader struct {
-	closed        chan interface{}
+	closed        chan struct{}
 	stream        io.ReadCloser
 	consumeStream bool
 }

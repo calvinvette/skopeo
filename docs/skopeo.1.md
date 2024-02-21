@@ -47,9 +47,12 @@ Most commands refer to container images, using a _transport_`:`_details_ format.
   **oci-archive:**_path_**:**_tag_
   An image _tag_ in a tar archive compliant with "Open Container Image Layout Specification" at _path_.
 
-See [containers-transports(5)](https://github.com/containers/image/blob/master/docs/containers-transports.5.md) for details.
+See [containers-transports(5)](https://github.com/containers/image/blob/main/docs/containers-transports.5.md) for details.
 
 ## OPTIONS
+
+These options should be placed before the subcommand name.
+Individual subcommands have their own options.
 
 **--command-timeout** _duration_
 
@@ -101,6 +104,7 @@ Print the version number
 | ----------------------------------------- | ------------------------------------------------------------------------------ |
 | [skopeo-copy(1)](skopeo-copy.1.md)        | Copy an image (manifest, filesystem layers, signatures) from one location to another. |
 | [skopeo-delete(1)](skopeo-delete.1.md)    | Mark the _image-name_ for later deletion by the registry's garbage collector.  |
+| [skopeo-generate-sigstore-key(1)](skopeo-generate-sigstore-key.1.md)    | Generate a sigstore public/private key pair.  |
 | [skopeo-inspect(1)](skopeo-inspect.1.md)  | Return low-level information about _image-name_ in a registry.                 |
 | [skopeo-list-tags(1)](skopeo-list-tags.1.md)  | List image names in a transport-specific collection of images.|
 | [skopeo-login(1)](skopeo-login.1.md)  | Login to a container registry. |
@@ -113,11 +117,11 @@ Print the version number
 ## FILES
   **/etc/containers/policy.json**
   Default trust policy file, if **--policy** is not specified.
-  The policy format is documented in [containers-policy.json(5)](https://github.com/containers/image/blob/master/docs/containers-policy.json.5.md) .
+  The policy format is documented in [containers-policy.json(5)](https://github.com/containers/image/blob/main/docs/containers-policy.json.5.md) .
 
   **/etc/containers/registries.d**
   Default directory containing registry configuration, if **--registries.d** is not specified.
-  The contents of this directory are documented in [containers-policy.json(5)](https://github.com/containers/image/blob/master/docs/containers-policy.json.5.md).
+  The contents of this directory are documented in [containers-registries.d(5)](https://github.com/containers/image/blob/main/docs/containers-registries.d.5.md).
 
 ## SEE ALSO
 skopeo-login(1), docker-login(1), containers-auth.json(5), containers-storage.conf(5), containers-policy.json(5), containers-transports(5)

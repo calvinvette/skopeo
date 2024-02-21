@@ -44,7 +44,7 @@ func noteCloseFailure(err error, description string, closeErr error) error {
 	if err == nil {
 		return fmt.Errorf("%s: %w", description, closeErr)
 	}
-	// In this case we prioritize the primary error for use with %w; closeErr is usually less relevant, or might be a consequence of the primary erorr.
+	// In this case we prioritize the primary error for use with %w; closeErr is usually less relevant, or might be a consequence of the primary error.
 	return fmt.Errorf("%w (%s: %v)", err, description, closeErr)
 }
 
@@ -315,14 +315,11 @@ func parseCreds(creds string) (string, string, error) {
 	if creds == "" {
 		return "", "", errors.New("credentials can't be empty")
 	}
-	up := strings.SplitN(creds, ":", 2)
-	if len(up) == 1 {
-		return up[0], "", nil
-	}
-	if up[0] == "" {
+	username, password, _ := strings.Cut(creds, ":") // Sets password to "" if there is no ":"
+	if username == "" {
 		return "", "", errors.New("username can't be empty")
 	}
-	return up[0], up[1], nil
+	return username, password, nil
 }
 
 func getDockerAuth(creds string) (*types.DockerAuthConfig, error) {

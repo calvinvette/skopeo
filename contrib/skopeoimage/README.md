@@ -1,6 +1,6 @@
 [comment]: <> (***ATTENTION*** ***WARNING*** ***ALERT*** ***CAUTION*** ***DANGER***)
 [comment]: <> ()
-[comment]: <> (ANY changes made to this file, once commited/merged must)
+[comment]: <> (ANY changes made to this file, once committed/merged must)
 [comment]: <> (be manually copy/pasted -in markdown- into the description)
 [comment]: <> (field on Quay at the following locations:)
 [comment]: <> ()
@@ -11,7 +11,7 @@
 [comment]: <> ()
 [comment]: <> (***ATTENTION*** ***WARNING*** ***ALERT*** ***CAUTION*** ***DANGER***)
 
-<img src="https://cdn.rawgit.com/containers/skopeo/master/docs/skopeo.svg" width="250">
+<img src="https://cdn.rawgit.com/containers/skopeo/main/docs/skopeo.svg" width="250">
 
 ----
 
@@ -25,9 +25,7 @@ the images live are public and can be pulled without credentials.  These contain
 resulting containers can run safely with privileges within the container.
 
 The container images are built using the latest Fedora and then Skopeo is installed into them.
-The PATH in the container images is set to the default PATH provided by Fedora.  Also, the
-ENTRYPOINT and the WORKDIR variables are not set within these container images, as such they
-default to `/`.
+The ENTRYPOINT of the container is set to execute the `skopeo` binary.
 
 The container images are:
 

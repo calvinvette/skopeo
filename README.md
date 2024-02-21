@@ -1,7 +1,4 @@
-skopeo [![Build Status](https://travis-ci.org/containers/skopeo.svg?branch=master)](https://travis-ci.org/containers/skopeo)
-=
-
-<img src="https://cdn.rawgit.com/containers/skopeo/master/docs/skopeo.svg" width="250">
+<img src="https://cdn.rawgit.com/containers/skopeo/main/docs/skopeo.svg" width="250" alt="Skopeo">
 
 ----
 
@@ -41,6 +38,12 @@ Skopeo works with API V2 container image registries such as [docker.io](https://
 
  * oci:path:tag
          An image tag in a directory compliant with "Open Container Image Layout Specification" at path.
+
+[Obtaining skopeo](./install.md)
+-
+
+For a detailed description how to install or build skopeo, see
+[install.md](./install.md).
 
 ## Inspecting a repository
 `skopeo` is able to _inspect_ a repository on a container registry and fetch images layers.
@@ -192,12 +195,6 @@ $ skopeo inspect --creds=testuser:testpassword docker://myregistrydomain.com:500
 $ skopeo copy --src-creds=testuser:testpassword docker://myregistrydomain.com:5000/private oci:local_oci_image
 ```
 
-[Obtaining skopeo](./install.md)
--
-
-For a detailed description how to install or build skopeo, see
-[install.md](./install.md).
-
 Contributing
 -
 
@@ -208,6 +205,7 @@ Please read the [contribution guide](CONTRIBUTING.md) if you want to collaborate
 | -------------------------------------------------- | ---------------------------------------------------------------------------------------------|
 | [skopeo-copy(1)](/docs/skopeo-copy.1.md)           | Copy an image (manifest, filesystem layers, signatures) from one location to another.        |
 | [skopeo-delete(1)](/docs/skopeo-delete.1.md)       | Mark the image-name for later deletion by the registry's garbage collector.                                                                |
+| [skopeo-generate-sigstore-key(1)](/docs/skopeo-generate-sigstore-key.1.md)    | Generate a sigstore public/private key pair.  |
 | [skopeo-inspect(1)](/docs/skopeo-inspect.1.md)     | Return  low-level  information about image-name in a registry.                                |
 | [skopeo-list-tags(1)](/docs/skopeo-list-tags.1.md) | Return a list of tags for the transport-specific image repository.                               |
 | [skopeo-login(1)](/docs/skopeo-login.1.md)         | Login to a container registry.                                                               |

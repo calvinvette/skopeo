@@ -6,10 +6,30 @@ import (
 	"io"
 
 	internalblobinfocache "github.com/containers/image/v5/internal/blobinfocache"
+	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/pkg/compression"
 	compressiontypes "github.com/containers/image/v5/pkg/compression/types"
 	"github.com/containers/image/v5/types"
+	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/maps"
+)
+
+var (
+	// defaultCompressionFormat is used if the destination transport requests
+	// compression, and the user does not explicitly instruct us to use an algorithm.
+	defaultCompressionFormat = &compression.Gzip
+
+	// compressionBufferSize is the buffer size used to compress a blob
+	compressionBufferSize = 1048576
+
+	// expectedCompressionFormats is used to check if a blob with a specified media type is compressed
+	// using the algorithm that the media type says it should be compressed with
+	expectedCompressionFormats = map[string]*compressiontypes.Algorithm{
+		imgspecv1.MediaTypeImageLayerGzip:      &compression.Gzip,
+		imgspecv1.MediaTypeImageLayerZstd:      &compression.Zstd,
+		manifest.DockerV2Schema2LayerMediaType: &compression.Gzip,
+	}
 )
 
 // bpDetectCompressionStepData contains data that the copy pipeline needs about the “detect compression” step.
@@ -50,13 +70,26 @@ func blobPipelineDetectCompressionStep(stream *sourceStream, srcInfo types.BlobI
 
 // bpCompressionStepData contains data that the copy pipeline needs about the compression step.
 type bpCompressionStepData struct {
-	operation              types.LayerCompression      // Operation to use for updating the blob metadata.
+	operation              bpcOperation                // What we are actually doing
+	uploadedOperation      types.LayerCompression      // Operation to use for updating the blob metadata (matching the end state, not necessarily what we do)
 	uploadedAlgorithm      *compressiontypes.Algorithm // An algorithm parameter for the compressionOperation edits.
 	uploadedAnnotations    map[string]string           // Annotations that should be set on the uploaded blob. WARNING: This is only set after the srcStream.reader is fully consumed.
 	srcCompressorName      string                      // Compressor name to record in the blob info cache for the source blob.
 	uploadedCompressorName string                      // Compressor name to record in the blob info cache for the uploaded blob.
 	closers                []io.Closer                 // Objects to close after the upload is done, if any.
 }
+
+type bpcOperation int
+
+const (
+	bpcOpInvalid              bpcOperation = iota
+	bpcOpPreserveOpaque                    // We are preserving something where compression is not applicable
+	bpcOpPreserveCompressed                // We are preserving a compressed, and decompressible, layer
+	bpcOpPreserveUncompressed              // We are preserving an uncompressed, and compressible, layer
+	bpcOpCompressUncompressed              // We are compressing uncompressed data
+	bpcOpRecompressCompressed              // We are recompressing compressed data
+	bpcOpDecompressCompressed              // We are decompressing compressed data
+)
 
 // blobPipelineCompressionStep updates *stream to compress and/or decompress it.
 // srcInfo is primarily used for error messages.
@@ -92,10 +125,11 @@ func (ic *imageCopier) blobPipelineCompressionStep(stream *sourceStream, canModi
 // bpcPreserveEncrypted checks if the input is encrypted, and returns a *bpCompressionStepData if so.
 func (ic *imageCopier) bpcPreserveEncrypted(stream *sourceStream, _ bpDetectCompressionStepData) (*bpCompressionStepData, error) {
 	if isOciEncrypted(stream.info.MediaType) {
+		// We can’t do anything with an encrypted blob unless decrypted.
 		logrus.Debugf("Using original blob without modification for encrypted blob")
-		// PreserveOriginal due to any compression not being able to be done on an encrypted blob unless decrypted
 		return &bpCompressionStepData{
-			operation:              types.PreserveOriginal,
+			operation:              bpcOpPreserveOpaque,
+			uploadedOperation:      types.PreserveOriginal,
 			uploadedAlgorithm:      nil,
 			srcCompressorName:      internalblobinfocache.UnknownCompression,
 			uploadedCompressorName: internalblobinfocache.UnknownCompression,
@@ -109,13 +143,13 @@ func (ic *imageCopier) bpcCompressUncompressed(stream *sourceStream, detected bp
 	if ic.c.dest.DesiredLayerCompression() == types.Compress && !detected.isCompressed {
 		logrus.Debugf("Compressing blob on the fly")
 		var uploadedAlgorithm *compressiontypes.Algorithm
-		if ic.c.compressionFormat != nil {
-			uploadedAlgorithm = ic.c.compressionFormat
+		if ic.compressionFormat != nil {
+			uploadedAlgorithm = ic.compressionFormat
 		} else {
 			uploadedAlgorithm = defaultCompressionFormat
 		}
 
-		reader, annotations := ic.c.compressedStream(stream.reader, *uploadedAlgorithm)
+		reader, annotations := ic.compressedStream(stream.reader, *uploadedAlgorithm)
 		// Note: reader must be closed on all return paths.
 		stream.reader = reader
 		stream.info = types.BlobInfo{ // FIXME? Should we preserve more data in src.info?
@@ -123,7 +157,8 @@ func (ic *imageCopier) bpcCompressUncompressed(stream *sourceStream, detected bp
 			Size:   -1,
 		}
 		return &bpCompressionStepData{
-			operation:              types.Compress,
+			operation:              bpcOpCompressUncompressed,
+			uploadedOperation:      types.Compress,
 			uploadedAlgorithm:      uploadedAlgorithm,
 			uploadedAnnotations:    annotations,
 			srcCompressorName:      detected.srcCompressorName,
@@ -137,7 +172,7 @@ func (ic *imageCopier) bpcCompressUncompressed(stream *sourceStream, detected bp
 // bpcRecompressCompressed checks if we should be recompressing a compressed input to another format, and returns a *bpCompressionStepData if so.
 func (ic *imageCopier) bpcRecompressCompressed(stream *sourceStream, detected bpDetectCompressionStepData) (*bpCompressionStepData, error) {
 	if ic.c.dest.DesiredLayerCompression() == types.Compress && detected.isCompressed &&
-		ic.c.compressionFormat != nil && ic.c.compressionFormat.Name() != detected.format.Name() {
+		ic.compressionFormat != nil && ic.compressionFormat.Name() != detected.format.Name() {
 		// When the blob is compressed, but the desired format is different, it first needs to be decompressed and finally
 		// re-compressed using the desired format.
 		logrus.Debugf("Blob will be converted")
@@ -153,20 +188,21 @@ func (ic *imageCopier) bpcRecompressCompressed(stream *sourceStream, detected bp
 			}
 		}()
 
-		recompressed, annotations := ic.c.compressedStream(decompressed, *ic.c.compressionFormat)
+		recompressed, annotations := ic.compressedStream(decompressed, *ic.compressionFormat)
 		// Note: recompressed must be closed on all return paths.
 		stream.reader = recompressed
-		stream.info = types.BlobInfo{ // FIXME? Should we preserve more data in src.info?
+		stream.info = types.BlobInfo{ // FIXME? Should we preserve more data in src.info? Notably the current approach correctly removes zstd:chunked metadata annotations.
 			Digest: "",
 			Size:   -1,
 		}
 		succeeded = true
 		return &bpCompressionStepData{
-			operation:              types.PreserveOriginal,
-			uploadedAlgorithm:      ic.c.compressionFormat,
+			operation:              bpcOpRecompressCompressed,
+			uploadedOperation:      types.PreserveOriginal,
+			uploadedAlgorithm:      ic.compressionFormat,
 			uploadedAnnotations:    annotations,
 			srcCompressorName:      detected.srcCompressorName,
-			uploadedCompressorName: ic.c.compressionFormat.Name(),
+			uploadedCompressorName: ic.compressionFormat.Name(),
 			closers:                []io.Closer{decompressed, recompressed},
 		}, nil
 	}
@@ -183,12 +219,13 @@ func (ic *imageCopier) bpcDecompressCompressed(stream *sourceStream, detected bp
 		}
 		// Note: s must be closed on all return paths.
 		stream.reader = s
-		stream.info = types.BlobInfo{ // FIXME? Should we preserve more data in src.info?
+		stream.info = types.BlobInfo{ // FIXME? Should we preserve more data in src.info? Notably the current approach correctly removes zstd:chunked metadata annotations.
 			Digest: "",
 			Size:   -1,
 		}
 		return &bpCompressionStepData{
-			operation:              types.Decompress,
+			operation:              bpcOpDecompressCompressed,
+			uploadedOperation:      types.Decompress,
 			uploadedAlgorithm:      nil,
 			srcCompressorName:      detected.srcCompressorName,
 			uploadedCompressorName: internalblobinfocache.Uncompressed,
@@ -199,7 +236,9 @@ func (ic *imageCopier) bpcDecompressCompressed(stream *sourceStream, detected bp
 }
 
 // bpcPreserveOriginal returns a *bpCompressionStepData for not changing the original blob.
-func (ic *imageCopier) bpcPreserveOriginal(stream *sourceStream, detected bpDetectCompressionStepData,
+// This does not change the sourceStream parameter; we include it for symmetry with other
+// pipeline steps.
+func (ic *imageCopier) bpcPreserveOriginal(_ *sourceStream, detected bpDetectCompressionStepData,
 	layerCompressionChangeSupported bool) *bpCompressionStepData {
 	logrus.Debugf("Using original blob without modification")
 	// Remember if the original blob was compressed, and if so how, so that if
@@ -210,14 +249,26 @@ func (ic *imageCopier) bpcPreserveOriginal(stream *sourceStream, detected bpDete
 	// But don’t touch blobs in objects where we can’t change compression,
 	// so that src.UpdatedImage() doesn’t fail; assume that for such blobs
 	// LayerInfosForCopy() should not be making any changes in the first place.
+	var bpcOp bpcOperation
+	var uploadedOp types.LayerCompression
 	var algorithm *compressiontypes.Algorithm
-	if layerCompressionChangeSupported && detected.isCompressed {
+	switch {
+	case !layerCompressionChangeSupported:
+		bpcOp = bpcOpPreserveOpaque
+		uploadedOp = types.PreserveOriginal
+		algorithm = nil
+	case detected.isCompressed:
+		bpcOp = bpcOpPreserveCompressed
+		uploadedOp = types.PreserveOriginal
 		algorithm = &detected.format
-	} else {
+	default:
+		bpcOp = bpcOpPreserveUncompressed
+		uploadedOp = types.Decompress
 		algorithm = nil
 	}
 	return &bpCompressionStepData{
-		operation:              types.PreserveOriginal,
+		operation:              bpcOp,
+		uploadedOperation:      uploadedOp,
 		uploadedAlgorithm:      algorithm,
 		srcCompressorName:      detected.srcCompressorName,
 		uploadedCompressorName: detected.srcCompressorName,
@@ -226,19 +277,18 @@ func (ic *imageCopier) bpcPreserveOriginal(stream *sourceStream, detected bpDete
 
 // updateCompressionEdits sets *operation, *algorithm and updates *annotations, if necessary.
 func (d *bpCompressionStepData) updateCompressionEdits(operation *types.LayerCompression, algorithm **compressiontypes.Algorithm, annotations *map[string]string) {
-	*operation = d.operation
+	*operation = d.uploadedOperation
 	// If we can modify the layer's blob, set the desired algorithm for it to be set in the manifest.
 	*algorithm = d.uploadedAlgorithm
 	if *annotations == nil {
 		*annotations = map[string]string{}
 	}
-	for k, v := range d.uploadedAnnotations {
-		(*annotations)[k] = v
-	}
+	maps.Copy(*annotations, d.uploadedAnnotations)
 }
 
-// recordValidatedBlobData updates b.blobInfoCache with data about the created uploadedInfo adnd the original srcInfo.
-// This must ONLY be called if all data has been validated by OUR code, and is not comming from third parties.
+// recordValidatedBlobData updates b.blobInfoCache with data about the created uploadedInfo (as returned by PutBlob)
+// and the original srcInfo (which the caller guarantees has been validated).
+// This must ONLY be called if all data has been validated by OUR code, and is not coming from third parties.
 func (d *bpCompressionStepData) recordValidatedDigestData(c *copier, uploadedInfo types.BlobInfo, srcInfo types.BlobInfo,
 	encryptionStep *bpEncryptionStepData, decryptionStep *bpDecryptionStepData) error {
 	// Don’t record any associations that involve encrypted data. This is a bit crude,
@@ -248,26 +298,49 @@ func (d *bpCompressionStepData) recordValidatedDigestData(c *copier, uploadedInf
 	// in the blob info cache (which would probably be necessary for any more complex logic),
 	// and the simplicity is attractive.
 	if !encryptionStep.encrypting && !decryptionStep.decrypting {
-		// If d.operation != types.PreserveOriginal, we now have two reliable digest values:
+		// If d.operation != bpcOpPreserve*, we now have two reliable digest values:
 		// srcinfo.Digest describes the pre-d.operation input, verified by digestingReader
 		// uploadedInfo.Digest describes the post-d.operation output, computed by PutBlob
-		// (because stream.info.Digest == "", this must have been computed afresh).
+		// (because we set stream.info.Digest == "", this must have been computed afresh).
 		switch d.operation {
-		case types.PreserveOriginal:
-			break // Do nothing, we have only one digest and we might not have even verified it.
-		case types.Compress:
+		case bpcOpPreserveOpaque:
+			// No useful information
+		case bpcOpCompressUncompressed:
 			c.blobInfoCache.RecordDigestUncompressedPair(uploadedInfo.Digest, srcInfo.Digest)
-		case types.Decompress:
+		case bpcOpDecompressCompressed:
 			c.blobInfoCache.RecordDigestUncompressedPair(srcInfo.Digest, uploadedInfo.Digest)
+		case bpcOpRecompressCompressed, bpcOpPreserveCompressed:
+			// We know one or two compressed digests. BlobInfoCache associates compression variants via the uncompressed digest,
+			// and we don’t know that one.
+			// That also means that repeated copies with the same recompression don’t identify reuse opportunities (unless
+			// RecordDigestUncompressedPair was called for both compressed variants for some other reason).
+		case bpcOpPreserveUncompressed:
+			c.blobInfoCache.RecordDigestUncompressedPair(srcInfo.Digest, srcInfo.Digest)
+		case bpcOpInvalid:
+			fallthrough
 		default:
 			return fmt.Errorf("Internal error: Unexpected d.operation value %#v", d.operation)
 		}
 	}
 	if d.uploadedCompressorName != "" && d.uploadedCompressorName != internalblobinfocache.UnknownCompression {
-		c.blobInfoCache.RecordDigestCompressorName(uploadedInfo.Digest, d.uploadedCompressorName)
+		if d.uploadedCompressorName != compressiontypes.ZstdChunkedAlgorithmName {
+			// HACK: Don’t record zstd:chunked algorithms.
+			// There is already a similar hack in internal/imagedestination/impl/helpers.CandidateMatchesTryReusingBlobOptions,
+			// and that one prevents reusing zstd:chunked blobs, so recording the algorithm here would be mostly harmless.
+			//
+			// We skip that here anyway to work around the inability of blobPipelineDetectCompressionStep to differentiate
+			// between zstd and zstd:chunked; so we could, in varying situations over time, call RecordDigestCompressorName
+			// with the same digest and both ZstdAlgorithmName and ZstdChunkedAlgorithmName , which causes warnings about
+			// inconsistent data to be logged.
+			c.blobInfoCache.RecordDigestCompressorName(uploadedInfo.Digest, d.uploadedCompressorName)
+		}
 	}
-	if srcInfo.Digest != "" && d.srcCompressorName != "" && d.srcCompressorName != internalblobinfocache.UnknownCompression {
-		c.blobInfoCache.RecordDigestCompressorName(srcInfo.Digest, d.srcCompressorName)
+	if srcInfo.Digest != "" && srcInfo.Digest != uploadedInfo.Digest &&
+		d.srcCompressorName != "" && d.srcCompressorName != internalblobinfocache.UnknownCompression {
+		if d.srcCompressorName != compressiontypes.ZstdChunkedAlgorithmName {
+			// HACK: Don’t record zstd:chunked algorithms, see above.
+			c.blobInfoCache.RecordDigestCompressorName(srcInfo.Digest, d.srcCompressorName)
+		}
 	}
 	return nil
 }
@@ -298,24 +371,24 @@ func doCompression(dest io.Writer, src io.Reader, metadata map[string]string, co
 }
 
 // compressGoroutine reads all input from src and writes its compressed equivalent to dest.
-func (c *copier) compressGoroutine(dest *io.PipeWriter, src io.Reader, metadata map[string]string, compressionFormat compressiontypes.Algorithm) {
+func (ic *imageCopier) compressGoroutine(dest *io.PipeWriter, src io.Reader, metadata map[string]string, compressionFormat compressiontypes.Algorithm) {
 	err := errors.New("Internal error: unexpected panic in compressGoroutine")
 	defer func() { // Note that this is not the same as {defer dest.CloseWithError(err)}; we need err to be evaluated lazily.
 		_ = dest.CloseWithError(err) // CloseWithError(nil) is equivalent to Close(), always returns nil
 	}()
 
-	err = doCompression(dest, src, metadata, compressionFormat, c.compressionLevel)
+	err = doCompression(dest, src, metadata, compressionFormat, ic.compressionLevel)
 }
 
 // compressedStream returns a stream the input reader compressed using format, and a metadata map.
 // The caller must close the returned reader.
 // AFTER the stream is consumed, metadata will be updated with annotations to use on the data.
-func (c *copier) compressedStream(reader io.Reader, algorithm compressiontypes.Algorithm) (io.ReadCloser, map[string]string) {
+func (ic *imageCopier) compressedStream(reader io.Reader, algorithm compressiontypes.Algorithm) (io.ReadCloser, map[string]string) {
 	pipeReader, pipeWriter := io.Pipe()
 	annotations := map[string]string{}
 	// If this fails while writing data, it will do pipeWriter.CloseWithError(); if it fails otherwise,
 	// e.g. because we have exited and due to pipeReader.Close() above further writing to the pipe has failed,
 	// we don’t care.
-	go c.compressGoroutine(pipeWriter, reader, annotations, algorithm) // Closes pipeWriter
+	go ic.compressGoroutine(pipeWriter, reader, annotations, algorithm) // Closes pipeWriter
 	return pipeReader, annotations
 }
